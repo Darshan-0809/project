@@ -1,195 +1,127 @@
-import streamlit as st
-from PyPDF2 import PdfReader
-from docx import Document
-import extract_msg
-from newspaper import Article
 import os
-from dotenv import load_dotenv
-import json
 import re
-
+import shutil
+import streamlit as st
+import pdfplumber
+from docx import Document
+from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+GOOGLE_API_KEY = os.getenv("Google_Api_key")
 
-# -------- File Extraction Functions --------
-def extract_text_from_pdf(file):
+# Initialize Gemini model and embedding
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="models/embedding-001", google_api_key=GOOGLE_API_KEY
+)
+model = ChatGoogleGenerativeAI(
+    model="models/gemini-2.5-pro", google_api_key=GOOGLE_API_KEY
+)
+
+# Folder containing your documents
+FOLDER_PATH = "Data"
+
+# ✅ Extract text (with tables) from PDF
+def get_pdf_text(file_obj):
     text = ""
-    pdf_reader = PdfReader(file)
-    for page in pdf_reader.pages:
-        text += page.extract_text()
+    with pdfplumber.open(file_obj) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
+            for table in page.extract_tables():
+                for row in table:
+                    row_text = " | ".join(cell or "" for cell in row)
+                    text += "\n" + row_text
     return text
 
-def extract_text_from_docx(file):
-    doc = Document(file)
-    return "\n".join([para.text for para in doc.paragraphs])
+# ✅ Extract text from PDFs, DOCX, TXT in folder
+def get_all_text_from_folder(folder_path):
+    combined_text = ""
+    for filename in os.listdir(folder_path):
+        filepath = os.path.join(folder_path, filename)
+        if filename.lower().endswith(".pdf"):
+            with open(filepath, "rb") as f:
+                combined_text += get_pdf_text(f)
+        elif filename.lower().endswith(".docx"):
+            doc = Document(filepath)
+            combined_text += "\n".join([para.text for para in doc.paragraphs])
+        elif filename.lower().endswith(".txt"):
+            with open(filepath, "r", encoding="utf-8") as f:
+                combined_text += f.read()
+    return combined_text
 
-def extract_text_from_msg(file):
-    msg = extract_msg.Message(file)
-    return msg.body
+# ✅ Create and save FAISS vector index
+def create_vector_store(text):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    docs = splitter.create_documents([text])
+    db = FAISS.from_documents(docs, embeddings)
+    db.save_local("faiss_index")
+    return db
 
-def extract_text_from_url(url):
-    article = Article(url)
-    article.download()
-    article.parse()
-    return article.text
+# ✅ Load existing FAISS index
+def load_vector_store():
+    return FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
 
-def get_combined_text(files, url_text):
-    full_text = ""
-    for file in files:
-        if file.name.endswith(".pdf"):
-            full_text += extract_text_from_pdf(file)
-        elif file.name.endswith(".docx"):
-            full_text += extract_text_from_docx(file)
-        elif file.name.endswith(".msg"):
-            full_text += extract_text_from_msg(file)
-    full_text += url_text
-    return full_text
+# ✅ Ask Gemini a question with improved strict prompt
+def ask_question(db, query):
+    results = db.similarity_search(query, k=3)
+    context = "\n".join([doc.page_content for doc in results])
 
-# -------- Chunking & Embedding --------
-def get_text_chunks(text):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
-    return splitter.split_text(text)
+    prompt = f"""
+You are a strict insurance assistant. Use ONLY the context below to answer the user's question.
 
-def get_vector_store(text_chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    store.save_local("faiss_index")
+🛑 Do NOT attempt to check or mention whether a specific policy name is present or not.
+✅ If the context answers the question (e.g., grace period, coverage, sum insured), provide the answer directly.
+🚫 Avoid saying things like:
+  - "The policy is not mentioned"
+  - "No such policy found"
+  - Any disclaimers about policy names
 
-# -------- Query Parsing --------
-def parse_query(user_query):
-    prompt_template = PromptTemplate(
-        input_variables=["query"],
-        template="""
-Extract the following fields from the query: age, gender, procedure, location, and policy duration.
-If not available, leave them as null.
-
-Query:
-{query}
-
-Respond in JSON:
-{{
-  "age": ...,
-  "gender": "...",
-  "procedure": "...",
-  "location": "...",
-  "policy_duration": "..."
-}}
-""")
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3)
-    chain = LLMChain(llm=model, prompt=prompt_template)
-    result = chain.run(query=user_query)
-    return result
-
-# -------- Decision Making Chain --------
-def get_decision_chain():
-    prompt_template = PromptTemplate(
-        input_variables=["structured_query", "context"],
-        template="""
-You are an expert insurance policy analyzer. Given the user's structured query and the context (retrieved clauses), determine whether the procedure is covered.
-
-Structured Query:
-{structured_query}
+🤫 If the answer is not found in the context at all, reply only:
+"Insufficient information in the document."
 
 Context:
 {context}
 
-Provide response in this exact JSON format:
-{{
-  "decision": "...",       // approved / rejected / unclear
-  "amount": "...",         // in ₹ or USD or "N/A"
-  "justification": "...",  // why the decision was made
-  "clauses_used": ["..."]  // list of clauses or section titles used
-}}
-""")
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3)
-    return LLMChain(llm=model, prompt=prompt_template)
+Question: {query}
 
-# -------- Clean & Display Result --------
-def clean_json_output(raw_output):
-    raw_output = re.sub(r"```json|```", "", raw_output).strip()
-    json_match = re.search(r"\{.*\}", raw_output, re.DOTALL)
-    if json_match:
-        return json_match.group(0)
-    return raw_output
+Answer:
+"""
 
-def user_input(user_question):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-    
-    docs = db.similarity_search(user_question, k=5)
-    context = "\n\n".join([doc.page_content for doc in docs])
-    
-    structured_query = parse_query(user_question)
-    
-    decision_chain = get_decision_chain()
-    result = decision_chain.run({
-        "structured_query": structured_query,
-        "context": context
-    })
+    response = model.invoke(prompt)
+    return response.content if hasattr(response, "content") else str(response)
 
-    st.subheader("📋 Structured JSON Output")
-    st.code(result, language='json')
-
-    try:
-        cleaned = clean_json_output(result)
-        result_dict = json.loads(cleaned)
-
-        readable_response = (
-            f"The procedure has been **{result_dict['decision']}**"
-            f"{' with a payout of ' + result_dict['amount'] if result_dict['amount'] != 'N/A' else ''}. "
-            f"This decision is based on {', '.join(result_dict['clauses_used'])}, "
-            f"which state: *{result_dict['justification']}*"
-        )
-
-        st.markdown("### 🧾 Natural Language Explanation")
-        st.markdown(readable_response)
-
-    except Exception as e:
-        st.error("Error parsing JSON: " + str(e))
-        st.text("Model output was:")
-        st.write(result)
-
-# -------- Streamlit App --------
+# ✅ Streamlit App UI
 def main():
-    st.set_page_config(page_title="Policy Decision AI")
-    st.header("🤖 Chat with Insurance Policy Docs")
+    st.set_page_config(page_title="Insurance Policy Q&A", layout="wide")
+    st.title("📘 Chat with Your Insurance Documents")
 
-    user_query = st.text_input("Enter your case description (e.g., '46-year-old male, knee surgery in Pune, 3-month-old policy')")
-    if user_query:
-        user_input(user_query)
+    # 🧹 Always delete old index to avoid confusion
+    if os.path.exists("faiss_index"):
+        shutil.rmtree("faiss_index")
 
-    with st.sidebar:
-        st.title("📂 Upload Files & URLs")
-        uploaded_files = st.file_uploader(
-            "Upload PDF, DOCX, or Email files",
-            accept_multiple_files=True,
-            type=["pdf", "docx", "msg"]
-        )
+    # 📄 Step 1: Process documents
+    if not os.path.exists("faiss_index"):
+        with st.spinner("📂 Processing your policy documents..."):
+            text = get_all_text_from_folder(FOLDER_PATH)
+            if not text.strip():
+                st.error("❌ No readable content found in your documents.")
+                return
+            db = create_vector_store(text)
+            st.success("✅ Documents processed successfully.")
+    else:
+        db = load_vector_store()
+        st.success("✅ Loaded existing memory (faiss_index)")
 
-        url_text = ""
-        url = st.text_input("🔗 Website URL")
-        if st.button("Fetch Website Content"):
-            with st.spinner("Fetching content..."):
-                try:
-                    url_text = extract_text_from_url(url)
-                    st.success("✅ Website content fetched.")
-                except Exception as e:
-                    st.error(f"Failed: {e}")
-
-        if st.button("Submit & Process"):
-            with st.spinner("Processing..."):
-                combined_text = get_combined_text(uploaded_files, url_text)
-                chunks = get_text_chunks(combined_text)
-                get_vector_store(chunks)
-                st.success("✅ Documents processed. Ask your question now.")
+    # 🧠 Step 2: User query
+    query = st.text_input("💬 Ask a question about your policy:")
+    if st.button("Ask") and query:
+        with st.spinner("🔍 Analyzing..."):
+            answer = ask_question(db, query)
+            st.markdown("### ✅ Answer:")
+            st.markdown(answer)
 
 if __name__ == "__main__":
     main()
