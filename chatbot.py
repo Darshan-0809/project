@@ -1,33 +1,62 @@
 import os
-import re
-import shutil
-import streamlit as st
+import requests
+import tempfile
 import pdfplumber
-from docx import Document
+import shutil
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
 from dotenv import load_dotenv
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 
-# Load environment variables
+# Load env variables
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("Google_Api_key")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+HACKRX_API_KEY = os.getenv("HACKRX_API_KEY", "hackrx2025")
 
-# Initialize Gemini model and embedding
-embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/embedding-001", google_api_key=GOOGLE_API_KEY
+# Auth setup
+auth_scheme = HTTPBearer()
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    if credentials.credentials != HACKRX_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+    return credentials.credentials
+
+# Gemini setup
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
+model = ChatGoogleGenerativeAI(model="models/gemini-2.5-pro", google_api_key=GOOGLE_API_KEY)
+
+# FastAPI setup
+app = FastAPI(
+    title="HackRx Insurance Policy QA API",
+    description="Submit a policy document URL and questions. Returns structured answers from Gemini 2.5 Pro.",
+    version="1.0.0"
 )
-model = ChatGoogleGenerativeAI(
-    model="models/gemini-2.5-pro", google_api_key=GOOGLE_API_KEY
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Folder containing your documents
-FOLDER_PATH = "Data"
+# Request/Response schema
+class QARequest(BaseModel):
+    documents: str
+    questions: List[str]
 
-# ✅ Extract text (with tables) from PDF
-def get_pdf_text(file_obj):
+class QAResponse(BaseModel):
+    answers: List[str]
+
+# Extract text and tables
+def extract_text_from_pdf(file_path: str) -> str:
     text = ""
-    with pdfplumber.open(file_obj) as pdf:
+    with pdfplumber.open(file_path) as pdf:
         for page in pdf.pages:
             text += page.extract_text() or ""
             for table in page.extract_tables():
@@ -36,92 +65,68 @@ def get_pdf_text(file_obj):
                     text += "\n" + row_text
     return text
 
-# ✅ Extract text from PDFs, DOCX, TXT in folder
-def get_all_text_from_folder(folder_path):
-    combined_text = ""
-    for filename in os.listdir(folder_path):
-        filepath = os.path.join(folder_path, filename)
-        if filename.lower().endswith(".pdf"):
-            with open(filepath, "rb") as f:
-                combined_text += get_pdf_text(f)
-        elif filename.lower().endswith(".docx"):
-            doc = Document(filepath)
-            combined_text += "\n".join([para.text for para in doc.paragraphs])
-        elif filename.lower().endswith(".txt"):
-            with open(filepath, "r", encoding="utf-8") as f:
-                combined_text += f.read()
-    return combined_text
+# Run /hackrx/run
+@app.post("/hackrx/run", response_model=QAResponse)
+async def run_qa(request: QARequest, token: str = Depends(verify_token)):
+    # Download file
+    try:
+        response = requests.get(request.documents, stream=True)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to download document.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-# ✅ Create and save FAISS vector index
-def create_vector_store(text):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    docs = splitter.create_documents([text])
-    db = FAISS.from_documents(docs, embeddings)
-    db.save_local("faiss_index")
-    return db
+    # Save to temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        for chunk in response.iter_content(chunk_size=8192):
+            tmp.write(chunk)
+        tmp_path = tmp.name
 
-# ✅ Load existing FAISS index
-def load_vector_store():
-    return FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    try:
+        # Extract text
+        raw_text = extract_text_from_pdf(tmp_path)
+        if not raw_text.strip():
+            raise HTTPException(status_code=400, detail="No readable text found in PDF.")
 
-# ✅ Ask Gemini a question with improved strict prompt
-def ask_question(db, query):
-    results = db.similarity_search(query, k=3)
-    context = "\n".join([doc.page_content for doc in results])
+        # Create vector DB
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        documents = splitter.create_documents([raw_text])
+        if os.path.exists("faiss_index"):
+            shutil.rmtree("faiss_index")
+        db = FAISS.from_documents(documents, embeddings)
 
-    prompt = f"""
+        # Process questions
+        answers = []
+        for question in request.questions:
+            results = db.similarity_search(question, k=3)
+            context = "\n".join([doc.page_content for doc in results])
+
+            prompt = f"""
 You are a strict insurance assistant. Use ONLY the context below to answer the user's question.
 
-🛑 Do NOT attempt to check or mention whether a specific policy name is present or not.
-✅ If the context answers the question (e.g., grace period, coverage, sum insured), provide the answer directly.
+🛑 Do NOT mention missing policy names or give disclaimers.
+✅ If context contains the answer, give it directly.
 🚫 Avoid saying things like:
-  - "The policy is not mentioned"
+  - "Policy not mentioned"
   - "No such policy found"
-  - Any disclaimers about policy names
 
-🤫 If the answer is not found in the context at all, reply only:
+🤫 If no info found, say:
 "Insufficient information in the document."
 
 Context:
 {context}
 
-Question: {query}
+Question: {question}
 
 Answer:
 """
+            result = model.invoke(prompt)
+            final_answer = result.content.strip() if hasattr(result, "content") else str(result).strip()
+            if not final_answer:
+                final_answer = "Insufficient information in the document."
+            answers.append(final_answer)
 
-    response = model.invoke(prompt)
-    return response.content if hasattr(response, "content") else str(response)
+        return {"answers": answers}
 
-# ✅ Streamlit App UI
-def main():
-    st.set_page_config(page_title="Insurance Policy Q&A", layout="wide")
-    st.title("📘 Chat with Your Insurance Documents")
-
-    # 🧹 Always delete old index to avoid confusion
-    if os.path.exists("faiss_index"):
-        shutil.rmtree("faiss_index")
-
-    # 📄 Step 1: Process documents
-    if not os.path.exists("faiss_index"):
-        with st.spinner("📂 Processing your policy documents..."):
-            text = get_all_text_from_folder(FOLDER_PATH)
-            if not text.strip():
-                st.error("❌ No readable content found in your documents.")
-                return
-            db = create_vector_store(text)
-            st.success("✅ Documents processed successfully.")
-    else:
-        db = load_vector_store()
-        st.success("✅ Loaded existing memory (faiss_index)")
-
-    # 🧠 Step 2: User query
-    query = st.text_input("💬 Ask a question about your policy:")
-    if st.button("Ask") and query:
-        with st.spinner("🔍 Analyzing..."):
-            answer = ask_question(db, query)
-            st.markdown("### ✅ Answer:")
-            st.markdown(answer)
-
-if __name__ == "__main__":
-    main()
+    finally:
+        os.remove(tmp_path)
