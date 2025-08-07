@@ -7,4 +7,4 @@ langchain
 langchain-google-genai
 langchain-community
 pydantic
-faiss-cpu
+faiss-cpu==1.7.4
