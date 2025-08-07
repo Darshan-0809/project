@@ -7,4 +7,4 @@ langchain
 langchain-google-genai
 langchain-community
 pydantic
-faiss-cpu==1.7.4
+https://github.com/facebookresearch/faiss/releases/download/v1.7.2/faiss_cpu-1.7.2-cp310-cp310-manylinux2014_x86_64.whl
