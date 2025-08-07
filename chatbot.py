@@ -17,7 +17,7 @@ from langchain_community.vectorstores import FAISS
 # Load env variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-HACKRX_API_KEY = os.getenv("HACKRX_API_KEY", "hackrx2025")
+HACKRX_API_KEY = os.getenv("HACKRX_API_KEY")
 
 # Auth setup
 auth_scheme = HTTPBearer()
@@ -130,3 +130,4 @@ Answer:
 
     finally:
         os.remove(tmp_path)
+
